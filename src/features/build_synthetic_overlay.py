@@ -230,7 +230,13 @@ def main():
             "bias_flipped": False,
         })
         row_id_counter += 1
-    log["periods"]["P0"] = {"n_rows": len(p0), "psi_target": 0.0, "psi_measured": {f: 0.0 for f in DRIFT_FEATURES}}
+    log["periods"]["P0"] = {
+        "n_rows": len(p0),
+        "psi_target": 0.0,
+        "psi_measured": {f: 0.0 for f in DRIFT_FEATURES},
+        "is_shock_period": False,
+        "bias_flips": {"n_eligible": 0, "n_flipped": 0, "flip_rate_achieved": 0.0},
+    }
 
     # --- 3. P1-P4: covariate drift (+ concept drift in the shock period) via weighted resample ---
     for period in PERIODS[1:]:
@@ -240,20 +246,32 @@ def main():
         strengths = calibrate_strengths(bin_codes_by_feature, n_bins_by_feature, ref_props, PSI_TARGETS[period])
         weights = combined_weights(bin_codes_by_feature, n_bins_by_feature, strengths)
 
-        is_shock = period == SHOCK_PERIOD
-        pre_shock_income_default = None
-        if is_shock:
-            pre_shock_income_default = default_rate_by_income_quartile(pool["AMT_INCOME_TOTAL"], pool["TARGET"])
-            concept_w = concept_drift_weights(pool["AMT_INCOME_TOTAL"], pool["TARGET"])
-            weights = weights * concept_w
-
+        # Stage 1: covariate drift only. (Note: since EXT_SOURCE_x is itself
+        # correlated with TARGET, this alone can shift the pool's overall
+        # default rate as a natural side effect -- that's expected covariate
+        # drift, not concept drift.)
         probs = weights / weights.sum()
         sampled_positions = rng.choice(len(pool), size=len(pool), replace=True, p=probs)
-        sampled = pool.iloc[sampled_positions].reset_index(drop=True)
+        sampled_covariate = pool.iloc[sampled_positions].reset_index(drop=True)
 
+        is_shock = period == SHOCK_PERIOD
+        pre_shock_income_default = None
         post_shock_income_default = None
         if is_shock:
+            # Stage 2 (shock period only): concept drift. Reweight relative to
+            # this period's OWN post-covariate-drift baseline, so the effect
+            # is isolated to flattening the income->TARGET spread rather than
+            # compounding with stage 1's level shift.
+            pre_shock_income_default = default_rate_by_income_quartile(
+                sampled_covariate["AMT_INCOME_TOTAL"], sampled_covariate["TARGET"]
+            )
+            concept_w = concept_drift_weights(sampled_covariate["AMT_INCOME_TOTAL"], sampled_covariate["TARGET"])
+            concept_probs = concept_w / concept_w.sum()
+            concept_positions = rng.choice(len(sampled_covariate), size=len(sampled_covariate), replace=True, p=concept_probs)
+            sampled = sampled_covariate.iloc[concept_positions].reset_index(drop=True)
             post_shock_income_default = default_rate_by_income_quartile(sampled["AMT_INCOME_TOTAL"], sampled["TARGET"])
+        else:
+            sampled = sampled_covariate
 
         # --- 4. Planted bias: label-flip a fraction of disadvantaged-group non-defaulters ---
         bias_flipped = pd.Series(False, index=sampled.index)
