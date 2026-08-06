@@ -324,9 +324,9 @@ def main():
 
     # --- 6. Save ---
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    overlay_path = OUT_DIR / "synthetic_overlay.parquet"
+    overlay_path = OUT_DIR / "synthetic_overlay.csv"
     log_path = OUT_DIR / "injection_log.json"
-    overlay.to_parquet(overlay_path, index=False)
+    overlay.to_csv(overlay_path, index=False)
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2, default=str)
 
