@@ -1,0 +1,12 @@
+# Personal preferences (rename to CLAUDE.local.md - this file is gitignored)
+
+Copy this to `CLAUDE.local.md` in the project root and edit freely.
+This file is personal to you and never committed - use it for things
+that don't belong in the shared CLAUDE.md.
+
+Examples of what to put here:
+- Your local Python environment name / activation command
+- Paths specific to your machine (e.g. where you keep the raw CSVs
+  if not in data/raw/ for space reasons)
+- Personal workflow preferences (e.g. "always show me the plot before
+  saving it", "prefer verbose print statements while debugging")

@@ -1,0 +1,27 @@
+# Raw data - too large for git, and should never be committed anyway
+data/raw/*
+!data/raw/.gitkeep
+
+# Large processed/synthetic outputs - regenerate from pipeline instead
+data/processed/*
+data/synthetic/*
+!data/processed/.gitkeep
+!data/synthetic/.gitkeep
+
+# Personal Claude Code preferences - never commit
+CLAUDE.local.md
+
+# Standard Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+
+
+docs/vibe_coding_prompts.md
