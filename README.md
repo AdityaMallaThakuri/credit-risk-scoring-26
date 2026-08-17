@@ -2,6 +2,35 @@
 
 Explainable, fair, and drift-aware credit risk scoring system.
 
+## Architecture
+
+Three layers, kept deliberately separate:
+
+- **Data layer** — a SQLite database (`data/processed/credit_risk.db`)
+  built by a SQL feature-extraction pipeline (`sql/`, run via
+  `src/features/run_sql_pipeline.py`) plus a set of precomputed CSV
+  artifacts from later analysis phases (calibration, fairness, drift,
+  Weighted Temporal SHAP — all under `data/processed/`).
+- **Backend** (`src/app/`, FastAPI) — the only process that touches
+  modeling code. At startup it loads one persisted pipeline
+  (preprocessor + LightGBM + isotonic calibrator, built by
+  `src/models/train_final_model.py`) and a SHAP explainer exactly once,
+  not per request, then serves ~15 endpoints across five routers:
+  applicant scoring/explanation, portfolio segments, fairness metrics
+  (including a live-threshold recompute), drift metrics, and Expected
+  Loss/profit simulation.
+- **Dashboard** (`src/app/dashboard/`, Streamlit) — six screens
+  (Portfolio Overview, Segments, Applicant SHAP, Fairness Over Time,
+  Drift Monitoring, and the Policy Simulator — an integrated threshold
+  slider that live-updates approval rate, Expected Loss, fairness
+  metrics, and a sample applicant's explanation together). This process
+  holds no state of its own and never imports modeling code — every
+  number it shows comes from an HTTP call to the backend, so the two
+  processes can be restarted or redeployed independently.
+
+Setup and run instructions for all three layers are below (step 3 for
+the data layer, steps 4–5 for the backend/dashboard).
+
 ## Setup on a new machine
 
 This repo's `.gitignore` deliberately excludes large/regenerable data
@@ -69,7 +98,65 @@ Each script is idempotent (safe to re-run) and reads/writes
 and `src/drift/` scripts can be run the same way — see each phase's
 notebook under `notebooks/` for the exact call order.
 
-### 4. Explore via the notebooks
+### 4. Build the deployable model artifact (required before running the app)
+
+The application (below) loads one persisted pipeline rather than
+refitting a model per request. Build it once, after step 3 above:
+
+```
+python src/models/train_final_model.py
+```
+
+This fits a fresh preprocessor + LightGBM + isotonic calibrator (an
+80/20 stratified train/calibration split, same split-before-resample
+discipline as everywhere else in this project) and writes
+`data/processed/final_model_pipeline.joblib`. Re-run it any time
+`modeling_feature_set` changes; it's the only artifact the app depends
+on that isn't already produced by step 3.
+
+### 5. Run the application
+
+Two processes, in two terminals, both from a repo with step 4 already
+done:
+
+```
+# Terminal 1 — backend API
+cd src/app
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+```
+# Terminal 2 — dashboard
+cd src/app/dashboard
+streamlit run Home.py --server.port 8501
+```
+
+- Backend: interactive API docs at `http://127.0.0.1:8000/docs`
+- Dashboard: `http://localhost:8501` — Streamlit auto-discovers the six
+  screens under `pages/` (Segments, Applicant SHAP, Fairness Over Time,
+  Drift Monitoring, Policy Simulator) as sidebar entries
+
+The dashboard talks to the backend over plain HTTP (`API_BASE_URL` env
+var, default `http://127.0.0.1:8000`) — it holds no state of its own and
+never imports modeling code directly, so the backend must already be
+running before the dashboard can show real data.
+
+### 6. Run the test suite
+
+```
+python -m pytest tests/ -v
+```
+
+63 tests covering calibration on held-out data, cost-sensitive threshold
+sanity at the extremes, SHAP additive consistency after Weighted
+Temporal SHAP's renormalization, and a functional smoke test for every
+backend endpoint (via FastAPI's in-process test client — no running
+server required). Takes about 20 seconds; the first test that touches
+the API pays a one-time ~15s cost to build the full application state
+(persisted model, feature table, SHAP explainer), shared across the rest
+of that test session.
+
+### 7. Explore via the notebooks
 
 ```
 jupyter lab

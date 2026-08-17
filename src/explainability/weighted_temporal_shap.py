@@ -49,23 +49,54 @@ deliberately simple) SHAP-GUIDED SELECTIVE THRESHOLD CORRECTION:
   1. Per period, identify a small "flagged feature set" -- features that
      are BOTH meaningfully drifted (PSI > PSI_FLAG_THRESHOLD) AND
      high-w_cost (top TOP_FLAG_FEATURES by w_cost among those).
-  2. Per applicant, find their single most-influential feature under the
-     alpha=0.5 blended explanation (argmax |weighted SHAP|). An applicant
-     is "flagged" if that top driver is in the period's flagged feature
-     set -- i.e., their decision is mainly being driven by a feature this
-     method has identified as both drifting and financially consequential.
+  2. Per applicant, find their TOP_N_DRIVERS_FOR_FLAG most-influential
+     features under the alpha=0.5 blended explanation (by |weighted
+     SHAP|). An applicant is "flagged" if ANY of those top-N drivers is in
+     the period's flagged feature set -- i.e., their decision is
+     meaningfully driven by a feature this method has identified as both
+     drifting and financially consequential. An earlier top-1-only
+     version was tried first and flagged only 0-13/500 applicants per
+     period -- too few for the per-gender correction below to do anything
+     but flip 0-2 people; top-N widens this to 62-129/500 (see Finding 2).
   3. Unflagged applicants keep the single global baseline threshold
      (identical decision to static SHAP / Method B -- unaffected).
-  4. Flagged applicants instead get a per-CODE_GENDER threshold, chosen
-     so each gender's approval rate WITHIN the flagged subset matches the
-     flagged subset's overall baseline approval rate (the same
-     equalize_dp mechanism as src/fairness/fairness_accuracy_tradeoff.py,
-     scoped only to the flagged subset instead of applied blanket).
+  4. Flagged applicants instead get a per-CODE_GENDER threshold, computed
+     from each gender's actually-repaid (TARGET==0) members within the
+     flagged subset, targeted at the population's overall baseline
+     approval rate among TARGET==0 applicants (the same equalize_eo
+     mechanism as src/fairness/fairness_accuracy_tradeoff.py, scoped to
+     the flagged subset and applied to all flagged applicants of that
+     gender since TARGET is unobserved at decision time). An earlier
+     equalize_dp-style version (target = flagged subset's OWN baseline
+     rate, ignoring TARGET) was tried first and is a near-tautological
+     no-op whenever that subset is already ~100% approved -- the common
+     case at BASELINE_APPROVAL_RATE=0.97 -- and, when it did act, made
+     both DPD and EOD *worse*; switching to this TARGET-aware convention
+     produced numerically identical flips/deltas at top-1 flagging,
+     which is what confirmed sample size (not metric choice) was the
+     binding constraint (Finding 2 below).
 This is evaluated against the Phase 1 planted CODE_GENDER label bias
 (same synthetic ground truth used in
 src/fairness/synthetic_bias_detection.py) so the "reduction" claim has a
 known-bias reference to be honest against, not just an unlabelled
 before/after.
+
+FINDINGS (from the ablation this module produces; see
+data/processed/phase6_fairness_reduction.csv for the numbers):
+  1. alpha=1.0 reproduces Method A's stability numbers exactly, as
+     required (a correctness check, not a modeling result).
+  2. The mitigation mechanism's fairness effect is drift-magnitude-
+     dependent, not uniformly reliable: with top-N-driver flagging, P3
+     (the concept-drift shock period, and the period with the largest
+     planted-bias gap per Phase 4) improves on BOTH DeltaDPD and DeltaEOD;
+     P2 improves DPD but worsens EOD; P4 worsens both; P1 has no
+     applicants flagged at all. Magnitudes are small throughout
+     (|Delta| <= 0.005, driven by only 1-3 actual decision flips even in
+     flagged subsets of 60-130 people) -- this is directional evidence
+     the mechanism can engage under large drift, not a strong or uniform
+     fairness-reduction claim. Reported honestly per period, not just as
+     an average, per this project's existing practice (see Phase 5's
+     honest stability-ranking reversal in shap_stability_eval.py).
 
 SCALE CAVEAT (stated explicitly, not silently): SHAP computation forces a
 500-applicant eval sample per period (BACKGROUND_SIZE/CALIB_SIZE/EVAL_SIZE
@@ -122,6 +153,10 @@ ALPHAS = [1.0, 0.75, 0.5, 0.25, 0.0]  # 1.0 == Method A; 0.0 == pure cost weight
 PRIMARY_ALPHA = 0.5  # the blended method used for the mitigation demonstration
 LGD_ASSUMPTION = 0.55  # matches src/models/expected_loss.py's fixed assumption
 TOP_FLAG_FEATURES = 3
+TOP_N_DRIVERS_FOR_FLAG = 5  # an applicant is "flagged" if ANY of their top-N |SHAP| drivers
+                             # is in the flagged feature set, not just their single top-1 driver --
+                             # top-1-only produced flagged subsets of 0-13/500, too small for the
+                             # per-gender quantile correction to do anything but flip 0-2 people.
 PSI_FLAG_THRESHOLD = 0.15
 BASELINE_APPROVAL_RATE = 0.97  # matches Phase 3 LightGBM's ~0.9697 optimal-threshold approval rate
 BIAS_PERIODS = ["P1", "P2", "P3", "P4"]
@@ -224,17 +259,35 @@ def selective_correction_fairness(pd_actual, weighted_values_alpha05, feature_na
     else:
         flagged_features = set()
 
-    top_driver_idx = np.argmax(np.abs(weighted_values_alpha05), axis=1)
-    top_driver_feature = feature_names[top_driver_idx]
-    flagged_mask = np.isin(top_driver_feature, list(flagged_features))
+    top_n_idx = np.argsort(-np.abs(weighted_values_alpha05), axis=1)[:, :TOP_N_DRIVERS_FOR_FLAG]
+    top_n_features = feature_names[top_n_idx]  # (n_applicants, TOP_N_DRIVERS_FOR_FLAG)
+    flagged_mask = np.isin(top_n_features, list(flagged_features)).any(axis=1)
 
     baseline_approved = pd_actual <= baseline_threshold
 
     corrected_approved = baseline_approved.copy()
-    if flagged_mask.sum() >= 2 and len(set(code_gender[flagged_mask])) >= 2:
-        flagged_baseline_rate = baseline_approved[flagged_mask].mean()
-        thresholds = group_threshold_for_target_rate(pd_actual[flagged_mask], code_gender[flagged_mask], flagged_baseline_rate)
+    n_flipped = 0
+    repaid_mask = target == 0
+    flagged_repaid_mask = flagged_mask & repaid_mask
+    correction_applied = (flagged_mask.sum() >= 2 and len(set(code_gender[flagged_mask])) >= 2
+                           and flagged_repaid_mask.sum() >= 2 and len(set(code_gender[flagged_repaid_mask])) >= 2)
+    if correction_applied:
+        # EOD-style correction (== equalize_eo's convention in
+        # fairness_accuracy_tradeoff.py): compute each group's threshold from
+        # ONLY its actually-repaid (TARGET==0) members, targeted at the
+        # population's baseline approval rate among TARGET==0 applicants --
+        # this engages the planted label bias directly, unlike an earlier
+        # DPD-style version tried first (equalize approval rate irrespective
+        # of TARGET), which Phase 4 already showed is structurally blind to
+        # this exact kind of label bias, and which produced identical output
+        # to this version -- confirming sample size, not metric choice, is
+        # this mechanism's binding constraint (see TOP_N_DRIVERS_FOR_FLAG).
+        # The resulting per-group threshold is applied to ALL flagged
+        # applicants (TARGET is unobserved at decision time).
+        target_rate = baseline_approved[repaid_mask].mean()
+        thresholds = group_threshold_for_target_rate(pd_actual[flagged_repaid_mask], code_gender[flagged_repaid_mask], target_rate)
         corrected_approved[flagged_mask] = apply_group_thresholds(pd_actual[flagged_mask], code_gender[flagged_mask], thresholds)
+        n_flipped = int((corrected_approved[flagged_mask] != baseline_approved[flagged_mask]).sum())
 
     def fairness_pair(approved):
         d = pd.DataFrame({"CODE_GENDER": code_gender, "approved": approved.astype(int), "TARGET": target})
@@ -248,6 +301,7 @@ def selective_correction_fairness(pd_actual, weighted_values_alpha05, feature_na
 
     return {
         "n_flagged": int(flagged_mask.sum()),
+        "n_flipped": n_flipped,
         "flagged_features": ", ".join(sorted(flagged_features)) if flagged_features else "(none)",
         "DPD_baseline": dpd_base, "DPD_corrected": dpd_corr, "DeltaDPD": dpd_base - dpd_corr,
         "EOD_baseline": eod_base, "EOD_corrected": eod_corr, "DeltaEOD": eod_base - eod_corr,
@@ -321,7 +375,8 @@ def main():
             result["period"] = period
             fairness_rows.append(result)
             print(f"  mitigation ({period}): flagged={result['n_flagged']}/{len(eval_)} "
-                  f"via [{result['flagged_features']}]  DeltaDPD={result['DeltaDPD']:+.4f}  DeltaEOD={result['DeltaEOD']:+.4f}")
+                  f"(flipped={result['n_flipped']}) via [{result['flagged_features']}]  "
+                  f"DeltaDPD={result['DeltaDPD']:+.4f}  DeltaEOD={result['DeltaEOD']:+.4f}")
 
     # --- stability comparison against static / Method A / B / C ---
     baseline_data = np.load(ADAPTIVE_SHAP_PATH, allow_pickle=True)
@@ -356,7 +411,7 @@ def main():
     print(stability_df.round(4).to_string())
 
     print("\n=== Fairness reduction vs. baseline (== Method B's unchanged decision), planted-bias periods ===")
-    print(fairness_df[["n_flagged", "DeltaDPD", "DeltaEOD"]].round(4).to_string())
+    print(fairness_df[["n_flagged", "n_flipped", "DeltaDPD", "DeltaEOD"]].round(4).to_string())
 
     return stability_df, fairness_df, weight_log
 
